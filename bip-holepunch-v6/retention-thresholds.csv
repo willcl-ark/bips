@@ -1,0 +1,6 @@
+nodes,retained_for_50_percent,retained_for_90_percent,retained_for_99_percent
+100,9,15,21
+1000,27,48,67
+10000,84,152,214
+100000,264,480,678
+1000000,833,1517,2145
