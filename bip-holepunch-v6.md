@@ -2,12 +2,12 @@
   BIP: ?
   Layer: Peer Services
   Title: Coordinatorless IPv4 TCP Hole Punching
-  Authors: TBD
+  Authors:
   Status: Draft
   Type: Specification
   Assigned: ?
   License: BSD-2-Clause
-  Version: 0.1.1
+  Version: 0.2.0
   Requires: 155, 324, 434
 ```
 
@@ -50,12 +50,13 @@ filtering, early resets, socket behavior, and NAT hairpinning also matter.
 See [RFC 5382](https://www.rfc-editor.org/rfc/rfc5382.html) and
 [RFC 9293, section 3.5](https://www.rfc-editor.org/rfc/rfc9293.html#section-3.5).
 
-This is an initial specification for review, not a deployable assignment.
-The address network ID and authors are unassigned. The numerical timing
-profile is provisional and has not been tested on real NATs. Socket
-experiments, realistic gossip measurements, and a networking implementation
-remain to be completed. The working filename's `v6` means the sixth design,
-not IPv6 or the wire-format version.
+This draft defines a version-0 profile for interoperable experiments.
+The proposed address network ID is not an approved assignment. Author
+details and a BIP number remain to be supplied. The timing profile and
+recommended local budgets are concrete starting points, not measured NAT
+or gossip performance. Public deployment still requires socket/NAT and
+reciprocal-discovery measurements. The working filename's `v6` means the
+sixth design, not IPv6 or the wire-format version.
 
 ## Specification
 
@@ -87,11 +88,11 @@ integer. Division followed by `floor` uses exact integer arithmetic.
 definitions; HKDF uses SHA256 as specified in
 [RFC 5869](https://www.rfc-editor.org/rfc/rfc5869.html).
 
-### Provisional timing profile
+### Version-0 timing profile
 
-These values define one consistent version-0 schedule. Implementations
-experimenting with this version MUST use the same schedule parameters;
-independent tuning would make peers disagree about attempts. Their
+Implementations of this version MUST use these schedule parameters;
+independent tuning would make peers disagree about attempts. Changing
+them requires a new incompatible format and cryptographic domain. Their
 suitability must be measured before deployment.
 
 | Parameter | Value |
@@ -103,6 +104,7 @@ suitability must be measured before deployment.
 | TCP establishment deadline | Scheduled start plus 10 seconds |
 | Complete handshake deadline | Scheduled start plus 20 seconds |
 | Clock-error assumption | At most 2 seconds from UTC at each endpoint |
+| Earliest origination in an epoch | Local epoch start plus 5 seconds |
 
 Epoch and round numbers are `floor(unix_time_seconds / 3600)` and
 `floor(unix_time_seconds / 60)`. Unix time excludes leap seconds. Round
@@ -148,9 +150,11 @@ NOT substitute an ephemeral source port for a holepunch attempt.
 
 ### Advertisement format
 
-This BIP requests a new BIP 155 network ID, called `HOLEPUNCH` below. Its
-numeric value is **TBD**. No existing network ID, including ordinary IPv4,
-is redefined. The `addr` payload is exactly 42 bytes:
+This BIP proposes BIP 155 network ID `0x08`, called `HOLEPUNCH` below.
+Experiments with this draft use that value on isolated test networks;
+public use requires its reservation through the BIP process. This proposal
+does not establish an assignment. No existing network ID, including
+ordinary IPv4, is redefined. The `addr` payload is exactly 42 bytes:
 
 | Type | Name | Meaning |
 |------|------|---------|
@@ -189,12 +193,42 @@ Ordinary relay fanout, source selection, and bandwidth policies apply.
 `sendaddrv2` remains necessary to send `addrv2`, but does not imply support
 for this network ID or willingness to attempt a connection.
 
+An advertiser SHOULD enqueue its current descriptor when observer
+agreement is established or restored, at each new epoch, and after a new
+address-relay peer completes its handshake and has sent `sendaddrv2`.
+Origination MUST wait until at least five seconds after the local epoch
+boundary, including on startup. This guard prevents a fast clock's new
+descriptor from reaching a compliant slow clock in its previous epoch.
+Origination uses the ordinary address send queue but MUST NOT depend on
+the ordinary local-address rebroadcast interval or on public listening
+reachability. Per-peer duplicate suppression still applies.
+Unsolicited messages carrying these records for onward relay SHOULD
+contain at most ten address records in total. Existing Bitcoin Core
+relay policy does not forward addresses from larger batches. Split queued
+announcements across ordinary send opportunities without bypassing rate
+limits; bulk `getaddr` responses retain their ordinary limits.
+
+Duplicate suppression MUST distinguish descriptors, including their epoch
+and key; the descriptor ID defined below is suitable. Endpoint-only
+suppression would hide the next epoch's record. At transmission time,
+discard expired or no-longer-retained records and recheck observer
+agreement for locally originated records. Relay queues and cached
+`getaddr` responses must not bypass these checks. Implementations MAY
+include retained records in ordinary `getaddr` responses within the
+existing combined message limits and response policies.
+
 Only records for the receiver's current epoch may be admitted or relayed.
 They expire at the epoch boundary regardless of outer timestamps. There
 is no preannouncement of the next epoch in this initial profile. A node
 MAY evict a record earlier under its normal resource policies. Retention
 for punching MUST be bounded and nonpersistent; this BIP does not require
 a particular cache implementation or size.
+
+Keep this cache separate from ordinary dialable addresses. A `HOLEPUNCH`
+record MUST NOT enter ordinary outbound, feeler, or anchor selection, or
+be converted to an ordinary IPv4 record. A successful punched connection
+MUST NOT mark its endpoint as publicly reachable in the ordinary address
+manager. Its reachability depended on a scheduled attempt.
 
 A node MUST retain at most one active record per endpoint. Once a valid
 record is admitted, a conflicting record for that endpoint MUST NOT
@@ -216,6 +250,10 @@ epoch while keeping the endpoint. After a restart that loses the key,
 it must wait for the next epoch or obtain a different external endpoint.
 Keys for a later epoch are independently generated. An authenticated
 connection does not expire merely because its advertisement does.
+Loss and recovery of observer agreement in the same epoch does not
+permit a new descriptor for the same endpoint. If an endpoint changes
+away and returns, reuse its original descriptor and key or wait for the
+next epoch.
 
 ### Pair derivation
 
@@ -346,6 +384,13 @@ is exactly 105 bytes:
 | `uint8[32]` | `receiver_id` | Receiver's pinned descriptor ID |
 | `uint8[32]` | `proof` | The MAC defined below |
 
+The experimental `featureid` is
+`277db3e91161123f45dbd6d5300cd8642c855d6f36660390c2e713a314217fdb`.
+The BIP 434 payload is `0x40 || ASCII(featureid) || 0x69 || featuredata`,
+where `0x40` and `0x69` are the CompactSize lengths. BIP 434's BIP 324
+message type is 37. Both advertised protocol versions MUST be at least
+70017. The `bip324_session_id` below is the raw 32-byte BIP 324 session ID.
+
 Let `role` be one byte, 0 for the sender being the BIP 324 initiator and
 1 for the sender being the responder. The proof is:
 
@@ -401,6 +446,50 @@ seconds between these bounds. Epoch boundaries coincide with round
 boundaries, so old and new epoch attempts do not overlap under these
 assumptions. This guard does not eliminate kernel `TIME_WAIT` constraints.
 
+### Recommended experimental local policy
+
+The following defaults make an initial implementation concrete. They are
+local policy, not additional inputs to pair derivation, and differing
+budgets can cause otherwise eligible attempts to be skipped. They have
+not been validated as production operating limits.
+
+| Resource | Initial default |
+|----------|-----------------|
+| Retained remote descriptors | 1,024, excluding the locally owned descriptor |
+| Observation connections | 3 steady connections in distinct network groups; at most 4 during replacement |
+| Observation refresh | Replace the oldest observer every 10 minutes; stop counting a report after 30 minutes |
+| New pair attempts | At most 4 per round |
+| Concurrent pending attempts | At most 4 |
+| Established holepunch allowance | 4 |
+
+Observation age is measured with a monotonic clock from receipt of the
+observer's `version`. Obtain a fresh report by connecting to a replacement
+observer from the same punch binding; a `ping` response does not update
+the reported mapping.
+Keep the old connection until its replacement completes the handshake,
+subject to the freshness and connection bounds. A failed replacement
+does not extend the old report's lifetime. Select observers using ordinary
+outbound destination restrictions and network-group diversity. These
+auxiliary connections consume additional resources at the public peers
+as well as locally.
+
+At each round boundary, take the currently retained valid candidates and
+select at most four eligible pairs in the specified priority order.
+Advertisements arriving later wait for the next round. Execute only
+those selections at their derived starts, with the required validity and
+capacity rechecks. Do not backfill skipped selections. Each selected pair
+has at most the initial connect and four scheduled retries. This bounds
+application connect calls to 20 per round, not the number of SYN packets.
+
+Keep healthy established connections until ordinary peer policy
+disconnects them; do not replace one just to admit a new candidate. Check
+capacity again before admitting a completed handshake. Address input,
+relay, cache admission, and ECDH work need bounded queues and local
+budgets. Reuse ordinary per-source address processing limits and private
+randomized cache admission/eviction, rather than using the public pair
+priority to decide cache admission. None of these defaults resolves the
+network-wide induced-SYN risk described below.
+
 ## Rationale
 
 ### Independent pair eligibility
@@ -413,9 +502,15 @@ limits can still prevent reciprocal attempts.
 
 Under the illustrative model where each of `N` nodes independently retains
 `m` uniform distinct peers, the expected number of mutually known peers
-is `m^2 / (N-1)`. For `N = 10,000`, `m = 256`, and the provisional
+is `m^2 / (N-1)`. For `N = 10,000`, `m = 256`, and the version-0
 threshold, there are about 2.05 mutually eligible opportunities per node
 per ten minutes before gossip expiry, capacity skips, and TCP failures.
+This also requires an average of eight locally eligible attempts per
+minute: most candidates do not retain the local advertisement. A smaller
+attempt budget reduces reciprocal attempts even with shared priorities.
+The recommended 1,024-entry cache and four-attempt cap trade additional
+retention for fewer connection attempts; the uncapped example is not a
+prediction for those defaults.
 This motivates an experiment, not a claimed connection success rate.
 The [discovery model](bip-holepunch-v6/plot_mutual_discovery.py) and
 [plot](bip-holepunch-v6/mutual-discovery.png) describe the snapshot
@@ -446,6 +541,12 @@ admitted record limits replacement churn but permits temporary squatting
 by forged records. Short epochs bound record lifetime. Current-epoch-only
 admission avoids overlapping keys for new attempts, at the cost of gossip
 warm-up after every epoch and possible delay after a restart.
+
+The first-admitted rule is retained for version 0: unsigned competing
+records provide no basis to prefer a replacement. Last-received-wins
+would instead allow continuous schedule disruption. Experiments should
+measure honest-record suppression, but the conflict rule is not left to
+implementation choice.
 
 ### Time and block hashes
 
@@ -529,21 +630,44 @@ not contact them. The experimental network ID is an explicit input.
 Run `python3 bip-holepunch-v6/test_vectors.py` to verify the frozen vectors,
 both sides' derivations, and malformed records and proofs. Regeneration
 requires the explicit `--generate` argument. These tests do not exercise
-sockets or the lifecycle. Networking tests must additionally cover epoch
-transitions, conflicting records, opposite clock errors, late gossip,
-local capacity skips, missing proofs, and established connections
-surviving expiry.
+sockets or the lifecycle. A networking implementation must additionally
+check at least the following cases:
 
-## Open items
+| Case | Required outcome |
+|------|------------------|
+| Clocks at +2 and -2 seconds; origination at local epoch second 5 | Both receivers are in the new epoch |
+| Queued advertisement crosses expiry | Discard before sending |
+| Same endpoint advertises a new epoch/key | Old descriptor does not suppress the new announcement |
+| Conflicting key for a retained endpoint in the same epoch | Keep the first descriptor |
+| Observer agreement is lost and restored | No intervening new attempts; reuse the original descriptor |
+| Gossip arrives after the scheduled start | Wait for a future opportunity |
+| Capacity fills while other handshakes are pending | Admit no more than the allowance; cancel remaining attempts |
+| Record is evicted after attempt start | Keep the attempt's pinned inputs |
+| A retry time arrives while connect is pending | Keep that socket and binding |
+| Missing, duplicate, or invalid proof before peer admission | Terminate the attempt |
+| Established connection outlives the epoch or observers | Keep the connection under ordinary peer policy |
 
-- Fill in author details and obtain an address network ID and BIP number.
-- Validate or revise the provisional timing and eligibility profile using
-  realistic gossip and socket/NAT experiments, including epoch warm-up.
-- Review the first-admitted conflict rule and its suppression tradeoff.
-- Confirm practical observation, cache, and extra-connection budgets.
-- Produce interoperable networking implementations.
+## Assignment and deployment work
+
+Author details, a BIP number, and reservation of the proposed address
+network ID remain administrative work. The version-0 wire profile,
+first-admitted conflict rule, and experimental local defaults above are
+the recommended starting point for implementation.
+
+Before public deployment, demonstrate interoperability between independent
+implementations and measure socket reuse and NAT traversal under clock
+skew, loss, resets, and mapping changes. Measure reciprocal advertisement
+visibility over each epoch, including time to rebuild caches, sparse
+adoption, conflicting records, and adversarial admission. Record actual
+SYN traffic as well as application attempts, observer load, and successful
+additional connections. The ten-minute target is evaluated after these
+losses; the snapshot discovery model alone cannot establish it. Failure
+to meet that target is grounds to revisit the profile, not to tune shared
+parameters independently.
 
 ## Changelog
 
+- 0.2.0: Specify epoch-aware origination, experimental assignments and local
+  defaults.
 - 0.1.1: Add cryptographic reference code and conformance vectors.
 - 0.1.0: Initial coordinatorless IPv4 draft.
