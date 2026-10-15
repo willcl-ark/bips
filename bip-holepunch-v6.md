@@ -324,8 +324,8 @@ Local resource limits MAY cause a node to skip an otherwise eligible
 attempt. A node that is full MUST NOT start further attempts. Group
 candidates by remote IPv4 address before selection. A node MUST NOT start
 more than one new attempt per remote IPv4 address in a round, across all
-ports and keys. The scheduled retries of that
-attempt do not create another allocation. This is a resource grouping,
+ports and keys. The scheduled retries of that attempt do not create another
+allocation. This is a resource grouping,
 not a rule that one retained descriptor replaces other endpoints at that
 IP. The endpoint-specific conflict rule still applies.
 
@@ -475,6 +475,40 @@ seconds between these bounds. Epoch boundaries coincide with round
 boundaries, so old and new epoch attempts do not overlap under these
 assumptions. This guard does not eliminate kernel `TIME_WAIT` constraints.
 
+### Local resource limits
+
+Implementations MUST enforce finite local limits on address-processing
+and relay queues, retained descriptors, cryptographic work, scheduled
+and pending attempts, observation connections, and established holepunch
+connections. The numerical budgets are local policy. Exhausting a budget
+may cause an otherwise eligible attempt to be skipped; it MUST NOT change
+that pair's derived eligibility, priority, or start time.
+
+Cache admission SHOULD use private-keyed placement with limits on both
+the connected source's network group and the advertised destination's
+network group, as in ordinary address management. Protect retained entries
+against replacement floods. Placement SHOULD depend on endpoints and
+source groups, not advertisement keys or epochs. A public scheduling score
+MUST NOT decide cache admission or eviction. These rules do not turn a
+relay source into an authenticated origin or a claimed IP into proof of
+ownership. Keep multiple endpoints behind one IP subject to resource
+limits, rather than treating the first record as authoritative for that IP.
+
+Apply cheap framing, length, format, epoch, and destination checks before
+expensive curve validation. Charge per-source and aggregate work budgets
+before public-key decoding and ECDH, including for inputs later rejected
+as invalid or conflicting. Reuse derived keys while their inputs remain
+valid instead of repeating ECDH for each round.
+
+Implementations SHOULD maintain bounded recent-attempt history keyed by
+destination IPv4 address. Keep this history separate from descriptors so
+that changing keys, ports, or epochs, or evicting a descriptor, does not
+reset it. Receiving an advertisement or skipping a selection MUST NOT
+create or extend a destination cooldown. Failed holepunch attempts MUST
+NOT update ordinary address-manager failure history or, by themselves,
+cause an IP ban or discouragement. They can result from NAT incompatibility,
+asymmetric selection, or a forged descriptor for an honest endpoint.
+
 ### Recommended experimental local policy
 
 The following defaults make an initial implementation concrete. Their
@@ -492,6 +526,9 @@ operating limits.
 | New pair attempts | At most 4 per round |
 | Concurrent pending attempts | At most 4 |
 | Established holepunch allowance | 4 |
+| Pending or established holepunch connections per remote IPv4 | At most 1 combined |
+| Recent-attempt cooldown per destination IPv4 | 10 minutes from attempt start |
+| Recent-attempt history | At most 64 destination IPv4 addresses |
 
 Observation age is measured with a monotonic clock from receipt of the
 observer's `version`. Obtain a fresh report by connecting to a replacement
@@ -505,9 +542,17 @@ auxiliary connections consume additional resources at the public peers
 as well as locally.
 
 At each round boundary, take the currently retained valid candidates,
-excluding endpoint tuples with an existing connection or pending attempt.
+excluding destinations in cooldown or at their per-IP connection limit,
+and endpoint tuples with an existing connection or pending attempt.
 Group them by remote IPv4 address and select eligible groups in the
 specified priority order up to the configured per-round attempt budget.
+Reserve pending-attempt and established-connection capacity, and room for
+a cooldown entry, for each selection, accounting for attempts already
+pending. Select fewer groups if there is insufficient capacity. This
+prevents an earlier start time from displacing a higher-priority group's
+allocation. A reservation alone does not start a cooldown. Release unused
+reservations when an attempt is skipped or fails; transfer connection
+capacity on admission. A started cooldown retains its fixed expiry.
 Choose one endpoint pair per selected group using `endpoint_priority`.
 Advertisements arriving later wait for the next round. Execute only those
 selections at their derived starts, with the required validity and capacity
@@ -517,14 +562,24 @@ and four scheduled retries. With the recommended four-attempt budget this
 bounds application connect calls to 20 per round, not the number of SYN
 packets.
 
+Before starting an attempt, allocate a history entry for its remote IPv4
+address and set its monotonic expiry to the start plus the configured
+cooldown. If the bounded history has no free or expired entry, skip an
+attempt requiring a new entry; do not evict an unexpired entry to make
+room. TCP retries belong to the same attempt and do not change the expiry.
+Neither a failure nor a short-lived successful connection extends or
+clears the entry. Once it expires, the IP may be considered again. This
+is finite retry throttling, not a blacklist. The per-IP connection limit
+also applies at handshake admission and across advertisement changes.
+
 Keep healthy established connections until ordinary peer policy
 disconnects them; do not replace one just to admit a new candidate. Check
-capacity again before admitting a completed handshake. Address input,
-relay, cache admission, and ECDH work need bounded queues and local
-budgets. Reuse ordinary per-source address processing limits and private
-randomized cache admission/eviction, rather than using the public pair
-priority to decide cache admission. None of these defaults resolves the
-network-wide induced-SYN risk described below.
+capacity again before admitting a completed handshake. The per-IP limits
+reduce opportunities for distinct honest nodes sharing a NAT. Cooldowns
+also reduce honest reciprocal attempts, particularly when the two nodes'
+histories differ; evaluate those losses when choosing local budgets.
+None of these defaults resolves the network-wide induced-SYN risk
+described below.
 
 ## Rationale
 
@@ -637,7 +692,19 @@ diversity, CPU budgets, and destination cooldowns remain necessary.
 **Conflicting records.** Unsigned gossip can poison an endpoint's retained
 record, cause mismatched schedules, or cause connection proofs to fail.
 The first-admitted rule offers no authoritative way to identify the honest
-record. Ordinary outbound diversity remains independent of this pool.
+record. Repeated forgeries can renew suppression in later epochs; an
+epoch bounds a record's lifetime, not the duration of an attack. A forged
+ordinary address naming an honest service still points at that service,
+whereas a forged holepunch key can prevent its rendezvous or proof from
+matching. Ordinary outbound diversity remains independent of this pool.
+
+**Address-discovery baseline.** The resilience target is to avoid making
+address poisoning and resource exhaustion materially cheaper than in
+ordinary address discovery. Reusing `addrv2` relay does not automatically
+inherit an address manager's private selection, protected successful-peer
+history, or source and destination bucketing. In particular, the public
+lottery still lets an attacker select favorable invented IPs before
+submitting them. Equivalent resistance has not been demonstrated.
 
 **Observers and clocks.** Colluding observers can report a false mapping;
 network-group agreement is not authentication. Stale mappings, lost
@@ -692,6 +759,11 @@ check at least the following cases:
 | Conflicting key for a retained endpoint in the same epoch | Keep the first descriptor |
 | Several retained endpoints share a remote public IP | Keep distinct endpoint records; select at most one attempt for the IP per round |
 | A selected endpoint becomes unusable before its start | Skip without backfilling another endpoint at that IP |
+| Fewer free slots than the round attempt budget; a lower-priority pair starts earlier | Reserve available slots in group-priority order |
+| Key, port, or epoch changes after an attempt starts | Preserve the IP's cooldown until its fixed expiry |
+| Advertisements or skipped selections arrive during a cooldown | Do not extend its expiry or penalize ordinary addresses |
+| All history entries are unexpired | Skip attempts needing a new entry instead of evicting cooldowns |
+| Distinct ports at one IP complete handshakes | Enforce the configured per-IP connection limit at admission |
 | Observer agreement is lost and restored | No intervening new attempts; reuse the original descriptor |
 | Gossip arrives after the scheduled start | Wait for a future opportunity |
 | Capacity fills while other handshakes are pending | Admit no more than the allowance; cancel remaining attempts |
@@ -718,10 +790,24 @@ losses; the snapshot discovery model alone cannot establish it. Failure
 to meet that target is grounds to revisit the profile, not to tune shared
 parameters independently.
 
+Compare adversarial behavior with ordinary address discovery under matched
+budgets for connected sources and their network groups, controlled IPs,
+accepted advertisements, and transmitted bytes. Include key and port
+grinding at fixed IPs, fabricated IPs chosen for favorable public draws,
+source-group floods, conflicting records at epoch rollover, and churn of
+ports, keys, and cache entries during cooldowns. Measure honest connection
+opportunities lost per accepted advertisement, cache displacement, and
+traffic induced at uninvolved destinations. Test honest shared-NAT
+populations and asymmetric histories across several cache, attempt, and
+cooldown budgets. This comparison is deployment work, not a result of the
+cryptographic conformance tests.
+
 ## Changelog
 
 - 0.3.0: Replace format 0 with an IP-pair eligibility and priority lottery;
-  retain shared endpoint selection, ECDH-derived times, and local budgets.
+  retain shared endpoint selection and ECDH-derived times. Specify bounded
+  admission and retry policies with local budgets and address-discovery
+  comparison criteria.
 - 0.2.0: Specify epoch-aware origination, experimental assignments and local
   defaults.
 - 0.1.1: Add cryptographic reference code and conformance vectors.
