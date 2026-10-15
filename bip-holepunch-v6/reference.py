@@ -1,4 +1,4 @@
-"""Test-only reference for the version-0 holepunch cryptographic formulas.
+"""Test-only reference for the version-1 holepunch cryptographic formulas.
 
 No networking or lifecycle implementation. This code is not constant-time and
 MUST NOT handle production secrets. IPv4 policy uses Python's address classes;
@@ -26,7 +26,7 @@ def mac(key, data):
     return hmac.new(key, data, hashlib.sha256).digest()
 
 
-FEATURE_ID = sha256(b"BitcoinHolePunch/v0/feature").hex().encode("ascii")
+FEATURE_ID = sha256(b"BitcoinHolePunch/v1/feature").hex().encode("ascii")
 
 
 def public_key(secret):
@@ -55,7 +55,7 @@ class Descriptor:
     port: int
 
     def __post_init__(self):
-        if len(self.chain) != 32 or len(self.payload) != 42 or self.payload[0] != 0:
+        if len(self.chain) != 32 or len(self.payload) != 42 or self.payload[0] != 1:
             raise ValueError("invalid descriptor encoding")
         address = ipaddress.IPv4Address(self.payload[1:5])
         if not address.is_global or address.is_multicast or not 1 <= self.port <= 65535:
@@ -71,8 +71,12 @@ class Descriptor:
         return int.from_bytes(self.payload[5:9], "little")
 
     @property
+    def ipv4(self):
+        return self.payload[1:5]
+
+    @property
     def endpoint(self):
-        return self.payload[1:5] + self.port.to_bytes(2, "big")
+        return self.ipv4 + self.port.to_bytes(2, "big")
 
     @property
     def encoded(self):
@@ -85,7 +89,7 @@ class Descriptor:
 
 def advertisement(ipv4, epoch, key):
     decode_key(key)
-    return b"\x00" + ipaddress.IPv4Address(ipv4).packed + epoch.to_bytes(4, "little") + key
+    return b"\x01" + ipaddress.IPv4Address(ipv4).packed + epoch.to_bytes(4, "little") + key
 
 
 def compact_size(value):
@@ -105,13 +109,13 @@ def addrv2(descriptor, timestamp, services, network_id):
 
 def pair_keys(secret, local, peer):
     if (local.chain != peer.chain or local.epoch != peer.epoch
-            or local.endpoint == peer.endpoint or local.key == peer.key):
+            or local.ipv4 == peer.ipv4 or local.key == peer.key):
         raise ValueError("invalid pair")
     if public_key(secret) != local.key:
         raise ValueError("secret does not match local descriptor")
     lo, hi = sorted((local, peer), key=lambda item: item.key)
     z = (secret * decode_key(peer.key)).x.to_bytes()
-    salt = sha256(b"BitcoinHolePunch/v0" + lo.encoded + hi.encoded)
+    salt = sha256(b"BitcoinHolePunch/v1" + lo.encoded + hi.encoded)
     prk = mac(salt, z)
     return {"z": z, "salt": salt, "prk": prk,
             "schedule": mac(prk, b"schedule\x01"),
@@ -126,17 +130,25 @@ def offset(time_draw):
     return 5000 + int.from_bytes(time_draw, "big") * 30000 // 2**256
 
 
-def schedule(key, epoch, round_number):
-    if round_number // 60 != epoch:
+def schedule(key, local, peer, round_number):
+    if (local.chain != peer.chain or local.epoch != peer.epoch
+            or local.ipv4 == peer.ipv4):
+        raise ValueError("invalid scheduling pair")
+    if round_number // 60 != local.epoch:
         raise ValueError("round outside descriptor epoch")
     encoded_round = round_number.to_bytes(8, "little")
-    draw = mac(key, b"eligibility" + encoded_round)
+    lo, hi = sorted((local.ipv4, peer.ipv4))
+    context = local.chain + encoded_round + lo + hi
+    draw = sha256(b"BitcoinHolePunch/v1/eligibility" + context)
+    endpoint_lo, endpoint_hi = sorted((local.endpoint, peer.endpoint))
+    endpoint_context = local.chain + encoded_round + endpoint_lo + endpoint_hi
     time_draw = mac(key, b"time" + encoded_round)
     delay = offset(time_draw)
     return {"draw": draw.hex(), "eligible": eligible(draw),
             "time_draw": time_draw.hex(), "offset_ms": delay,
             "start_ms": 60000 * round_number + delay,
-            "priority": mac(key, b"priority" + encoded_round).hex()}
+            "priority": sha256(b"BitcoinHolePunch/v1/priority" + context).hex(),
+            "endpoint_priority": sha256(b"BitcoinHolePunch/v1/endpoint" + endpoint_context).hex()}
 
 
 def feature_data(key, session_id, round_number, sender, receiver, role):
@@ -144,7 +156,7 @@ def feature_data(key, session_id, round_number, sender, receiver, role):
         raise ValueError("invalid proof context")
     context = round_number.to_bytes(8, "little") + sender.id + receiver.id
     proof = mac(key, b"connection" + session_id + context + bytes([role]))
-    return b"\x00" + context + proof
+    return b"\x01" + context + proof
 
 
 def verify_feature(data, key, session_id, round_number, sender, receiver, role):

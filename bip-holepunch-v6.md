@@ -7,7 +7,7 @@
   Type: Specification
   Assigned: ?
   License: BSD-2-Clause
-  Version: 0.2.0
+  Version: 0.3.0
   Requires: 155, 324, 434
 ```
 
@@ -16,8 +16,9 @@
 This document specifies additional Bitcoin peer connections between IPv4
 nodes behind compatible NATs or stateful firewalls. Nodes gossip an
 external endpoint and an ephemeral public key through `addrv2`. Two nodes
-that retain each other's advertisements derive the same connection times
-from a shared secret and independently attempt TCP simultaneous open.
+that retain each other's advertisements derive shared eligibility and
+priority from their public IPv4 addresses, and connection times from a
+shared secret, then independently attempt TCP simultaneous open.
 There is no coordinator, pair-selection service, or rendezvous message.
 
 Successful connections have a separate `holepunch` connection type and
@@ -50,7 +51,7 @@ filtering, early resets, socket behavior, and NAT hairpinning also matter.
 See [RFC 5382](https://www.rfc-editor.org/rfc/rfc5382.html) and
 [RFC 9293, section 3.5](https://www.rfc-editor.org/rfc/rfc9293.html#section-3.5).
 
-This draft defines a version-0 profile for interoperable experiments.
+This draft defines a version-1 profile for interoperable experiments.
 The proposed address network ID is not an approved assignment. Author
 details and a BIP number remain to be supplied. The timing profile and
 recommended local budgets are concrete starting points, not measured NAT
@@ -88,7 +89,7 @@ integer. Division followed by `floor` uses exact integer arithmetic.
 definitions; HKDF uses SHA256 as specified in
 [RFC 5869](https://www.rfc-editor.org/rfc/rfc5869.html).
 
-### Version-0 timing profile
+### Version-1 timing profile
 
 Implementations of this version MUST use these schedule parameters;
 independent tuning would make peers disagree about attempts. Changing
@@ -99,7 +100,7 @@ suitability must be measured before deployment.
 |-----------|-------|
 | Round duration | 60 seconds |
 | Epoch duration | 3,600 seconds (60 rounds) |
-| Eligibility threshold | `2^251`, giving probability `1/32` per pair per round |
+| Eligibility threshold | `2^251`, giving probability `1/32` per IPv4 pair per round |
 | Start offset within a round | From 5,000 through 34,999 milliseconds |
 | TCP establishment deadline | Scheduled start plus 10 seconds |
 | Complete handshake deadline | Scheduled start plus 20 seconds |
@@ -158,7 +159,7 @@ ordinary IPv4, is redefined. The `addr` payload is exactly 42 bytes:
 
 | Type | Name | Meaning |
 |------|------|---------|
-| `uint8` | `format` | 0 for this specification |
+| `uint8` | `format` | 1 for this specification |
 | `uint8[4]` | `ipv4` | IPv4 address in network byte order |
 | `uint32` | `epoch` | UTC epoch number |
 | `uint8[33]` | `public_key` | Compressed secp256k1 public key |
@@ -258,8 +259,8 @@ next epoch.
 ### Pair derivation
 
 Both nodes must possess the same two descriptors, from the same epoch,
-to derive a matching schedule. Reject a pair with equal endpoints or
-equal public keys. For an advertisement define:
+to derive matching connection times and proofs. Reject a pair with equal
+public IPv4 addresses or equal public keys. For an advertisement define:
 
 ```text
 chain = SHA256(SHA256(serialized_genesis_block_header))
@@ -282,7 +283,7 @@ Let `d` be the local secret scalar and `Q` the decoded peer public key:
 
 ```text
 Z = big_endian_32_bytes(x_coordinate(d * Q))
-salt = SHA256("BitcoinHolePunch/v0" || D_lo || D_hi)
+salt = SHA256("BitcoinHolePunch/v1" || D_lo || D_hi)
 PRK = HKDF-Extract(salt, Z)
 K_schedule = HKDF-Expand(PRK, "schedule", 32)
 K_auth = HKDF-Expand(PRK, "authentication", 32)
@@ -294,29 +295,57 @@ Neither a block anchor nor a signature is part of the derivation.
 
 ### Scheduling
 
-For a current or future round `r` belonging to the descriptors' epoch,
-compute:
+Order the two four-byte public IPv4 addresses lexicographically, giving
+`IP_lo` and `IP_hi`. This ordering is independent of the public-key
+ordering used for transport roles. For a current or future round `r`
+belonging to the descriptors' epoch, compute:
 
 ```text
-draw = int256(HMAC-SHA256(K_schedule, "eligibility" || u64le(r)))
+S = chain || u64le(r) || IP_lo || IP_hi
+draw = int256(SHA256("BitcoinHolePunch/v1/eligibility" || S))
 eligible = draw < 2^251
+priority = SHA256("BitcoinHolePunch/v1/priority" || S)
 U = int256(HMAC-SHA256(K_schedule, "time" || u64le(r)))
 offset_ms = 5000 + floor(U * 30000 / 2^256)
 start_ms = 60000 * r + offset_ms
-priority = HMAC-SHA256(K_schedule, "priority" || u64le(r))
 ```
 
-Eligibility is determined independently for each pair. A node MUST NOT
-change the threshold according to its cache size or make eligibility
-depend on the pair's ranking among unrelated candidates. Knowledge of a
-third node does not change the pair's eligibility or start time.
+`S` is 48 bytes. Eligibility and priority are public and identical for
+all descriptors using the same pair of IPv4 addresses in a round.
+Changing a key or port cannot improve either value. The exact start
+time remains specific to the descriptor pair and its shared secret.
+
+Eligibility is determined independently for each IPv4 pair. A node MUST
+NOT change the threshold according to its cache size or make eligibility
+depend on ranking among unrelated candidates. Knowledge of a third node
+does not change a pair's eligibility or start time.
 
 Local resource limits MAY cause a node to skip an otherwise eligible
-attempt. A node that is full MUST NOT start further attempts. If a local
-policy ranks eligible pairs for a round, lower big-endian `priority`
-values rank first, with `D_lo || D_hi` as the tie-breaker. Each node may
-still select different pairs because its knowledge and capacity differ.
-A skipped attempt MUST NOT be moved to another time in the round.
+attempt. A node that is full MUST NOT start further attempts. Group
+candidates by remote IPv4 address before selection. A node MUST NOT start
+more than one new attempt per remote IPv4 address in a round, across all
+ports and keys. The scheduled retries of that
+attempt do not create another allocation. This is a resource grouping,
+not a rule that one retained descriptor replaces other endpoints at that
+IP. The endpoint-specific conflict rule still applies.
+
+If a local policy ranks eligible IPv4 groups, lower big-endian `priority`
+values rank first, with `IP_lo || IP_hi` as the tie-breaker. Within a
+selected group, it is RECOMMENDED to prefer the endpoint pair with the
+lowest big-endian `endpoint_priority`, defined as follows. Encode each
+endpoint as `ipv4 || u16be(port)` and order these six-byte encodings
+lexicographically as `E_lo` and `E_hi`:
+
+```text
+endpoint_priority = SHA256("BitcoinHolePunch/v1/endpoint" ||
+    chain || u64le(r) || E_lo || E_hi)
+```
+
+Use `E_lo || E_hi` to break ties. This preference varies by round without
+depending on keys. It MUST NOT affect the group's eligibility, priority,
+or number of allocations. Each node may still select different endpoint
+pairs because its retained records and capacity differ. A skipped attempt
+MUST NOT be moved to another time in the round.
 
 Only attempts whose scheduled start is still in the future when both
 records become available may be scheduled. At attempt start the node
@@ -372,20 +401,20 @@ protocol-version requirements apply; an incompatible peer fails the
 attempt.
 
 Until a BIP number is assigned, `featureid` is the 64-character lowercase
-hex encoding of `SHA256("BitcoinHolePunch/v0/feature")`. This identifier
+hex encoding of `SHA256("BitcoinHolePunch/v1/feature")`. This identifier
 is distinct from the earlier coordinator-based proposal. `featuredata`
 is exactly 105 bytes:
 
 | Type | Name | Meaning |
 |------|------|---------|
-| `uint8` | `format` | 0 |
+| `uint8` | `format` | 1 |
 | `uint64` | `round` | The pinned attempt round |
 | `uint8[32]` | `sender_id` | Sender's pinned descriptor ID |
 | `uint8[32]` | `receiver_id` | Receiver's pinned descriptor ID |
 | `uint8[32]` | `proof` | The MAC defined below |
 
 The experimental `featureid` is
-`277db3e91161123f45dbd6d5300cd8642c855d6f36660390c2e713a314217fdb`.
+`a3f13a7f6c39ee3c031aa28cffd55bc3cdbf7be05e5c0a0264c6b277af0346bc`.
 The BIP 434 payload is `0x40 || ASCII(featureid) || 0x69 || featuredata`,
 where `0x40` and `0x69` are the CompactSize lengths. BIP 434's BIP 324
 message type is 37. Both advertised protocol versions MUST be at least
@@ -448,10 +477,12 @@ assumptions. This guard does not eliminate kernel `TIME_WAIT` constraints.
 
 ### Recommended experimental local policy
 
-The following defaults make an initial implementation concrete. They are
-local policy, not additional inputs to pair derivation, and differing
-budgets can cause otherwise eligible attempts to be skipped. They have
-not been validated as production operating limits.
+The following defaults make an initial implementation concrete. Their
+numerical budgets are recommendations, not protocol requirements or
+additional inputs to pair derivation. Implementations MAY choose higher
+or lower budgets; differing budgets can cause otherwise eligible attempts
+to be skipped. These defaults have not been validated as production
+operating limits.
 
 | Resource | Initial default |
 |----------|-----------------|
@@ -473,13 +504,18 @@ outbound destination restrictions and network-group diversity. These
 auxiliary connections consume additional resources at the public peers
 as well as locally.
 
-At each round boundary, take the currently retained valid candidates and
-select at most four eligible pairs in the specified priority order.
-Advertisements arriving later wait for the next round. Execute only
-those selections at their derived starts, with the required validity and
-capacity rechecks. Do not backfill skipped selections. Each selected pair
-has at most the initial connect and four scheduled retries. This bounds
-application connect calls to 20 per round, not the number of SYN packets.
+At each round boundary, take the currently retained valid candidates,
+excluding endpoint tuples with an existing connection or pending attempt.
+Group them by remote IPv4 address and select eligible groups in the
+specified priority order up to the configured per-round attempt budget.
+Choose one endpoint pair per selected group using `endpoint_priority`.
+Advertisements arriving later wait for the next round. Execute only those
+selections at their derived starts, with the required validity and capacity
+rechecks. Do not backfill skipped selections, including with another
+endpoint at the same IP. Each selected pair has at most the initial connect
+and four scheduled retries. With the recommended four-attempt budget this
+bounds application connect calls to 20 per round, not the number of SYN
+packets.
 
 Keep healthy established connections until ordinary peer policy
 disconnects them; do not replace one just to admit a new candidate. Check
@@ -496,14 +532,19 @@ network-wide induced-SYN risk described below.
 
 If A selects B as its favorite candidate, B may select C instead. A shared
 ranking therefore does not establish a matching. Here A and B compute a
-shared random draw for their own pair. If it qualifies, knowledge of C
-does not change that decision. Missing advertisements and local capacity
-limits can still prevent reciprocal attempts.
+shared draw for their public IPv4 pair. If it qualifies, knowledge of C
+does not change that decision. Shared priorities also preserve correlation
+between the two nodes' selections when their budgets are limited. Missing
+advertisements and local capacity limits can still prevent reciprocal
+attempts. Endpoints sharing a public IP share one allocation; their
+endpoint preferences need not produce reciprocal choices from different
+retained sets.
 
 Under the illustrative model where each of `N` nodes independently retains
-`m` uniform distinct peers, the expected number of mutually known peers
-is `m^2 / (N-1)`. For `N = 10,000`, `m = 256`, and the version-0
-threshold, there are about 2.05 mutually eligible opportunities per node
+`m` uniform distinct peers, each on a distinct public IP, the expected
+number of mutually known peers is `m^2 / (N-1)`. For `N = 10,000`,
+`m = 256`, and the version-1 threshold, there are about 2.05 mutually
+eligible opportunities per node
 per ten minutes before gossip expiry, capacity skips, and TCP failures.
 This also requires an average of eight locally eligible attempts per
 minute: most candidates do not retain the local advertisement. A smaller
@@ -542,7 +583,7 @@ by forged records. Short epochs bound record lifetime. Current-epoch-only
 admission avoids overlapping keys for new attempts, at the cost of gossip
 warm-up after every epoch and possible delay after a restart.
 
-The first-admitted rule is retained for version 0: unsigned competing
+The first-admitted rule is retained for version 1: unsigned competing
 records provide no basis to prefer a replacement. Last-received-wins
 would instead allow continuous schedule disruption. Experiments should
 measure honest-record suppression, but the conflict rule is not left to
@@ -568,6 +609,11 @@ address encoding, service bit, or connection type is reinterpreted. This
 draft does not implement the earlier coordinator proposal's wire format,
 messages, or fallback behavior.
 
+Format 1 replaces the earlier experimental format 0. Implementations of
+this profile MUST reject format-0 advertisements and proofs; there is no
+fallback. The new cryptographic domain and feature identifier separate
+the incompatible scheduling rules.
+
 ## Security and privacy considerations
 
 **False addresses and SYN abuse.** Advertisements do not prove endpoint
@@ -579,13 +625,14 @@ a victim from the entire network. A network-wide mitigation is not
 specified by this BIP. Implementations need to evaluate this risk before
 deployment. Counting connect calls alone omits kernel retransmissions.
 
-**Sybil influence and grinding.** An attacker knows the shared secrets for
-pairs involving its own keys and can vary keys or other descriptor fields
-to obtain favorable eligibility, timing, or priority. The threshold is not
-proof of work or a Sybil defense. An IP:port uniqueness rule is not an
-operator-uniqueness rule. Cache admission, source diversity, CPU budgets,
-and destination cooldowns are local policies; they should not rely on
-advertised identities or assume changing a key makes a new destination.
+**Sybil influence and grinding.** For a fixed pair of public IPv4 addresses,
+keys and ports cannot change eligibility or group priority. An attacker
+can still search invented IP addresses for favorable draws without
+controlling those addresses. It can also grind ports for preference within
+one IP's allocation, or keys and ports for an exact start time. Neither
+the public lottery nor the per-IP allocation establishes an operator
+identity or makes false address claims costly. Cache admission, source
+diversity, CPU budgets, and destination cooldowns remain necessary.
 
 **Conflicting records.** Unsigned gossip can poison an endpoint's retained
 record, cause mismatched schedules, or cause connection proofs to fail.
@@ -599,9 +646,10 @@ a substitute for the profile's clock assumption.
 
 **Endpoint exposure.** Publishing an advertisement exposes the address
 and port of a previously unreachable node. Key rotation does not unlink
-a stable endpoint. Shared schedules are hidden from passive observers
-without either private key, but participating attackers know schedules
-for their own pairs. No anonymity guarantee is made.
+a stable endpoint. Eligibility, group priority, and endpoint preference
+are public. Only exact connection times remain hidden from passive
+observers without either private key; participating attackers can derive
+those times for their own pairs. No anonymity guarantee is made.
 
 ## Reference implementation
 
@@ -624,6 +672,9 @@ expected hexadecimal bytes for advertisements, descriptors, ECDH/KDF,
 schedule draws, and both directions of the session-bound proof. They
 include a shared x coordinate with a leading zero, both transport roles,
 invalid compressed keys, and exact eligibility and offset boundaries.
+Tests also check that changing keys or ports preserves the public-IP
+lottery, that both sides agree on all schedule values, and that exact
+times and connection proofs remain bound to the descriptors.
 The sample public endpoints are serialization inputs only; the tests do
 not contact them. The experimental network ID is an explicit input.
 
@@ -639,6 +690,8 @@ check at least the following cases:
 | Queued advertisement crosses expiry | Discard before sending |
 | Same endpoint advertises a new epoch/key | Old descriptor does not suppress the new announcement |
 | Conflicting key for a retained endpoint in the same epoch | Keep the first descriptor |
+| Several retained endpoints share a remote public IP | Keep distinct endpoint records; select at most one attempt for the IP per round |
+| A selected endpoint becomes unusable before its start | Skip without backfilling another endpoint at that IP |
 | Observer agreement is lost and restored | No intervening new attempts; reuse the original descriptor |
 | Gossip arrives after the scheduled start | Wait for a future opportunity |
 | Capacity fills while other handshakes are pending | Admit no more than the allowance; cancel remaining attempts |
@@ -650,7 +703,7 @@ check at least the following cases:
 ## Assignment and deployment work
 
 Author details, a BIP number, and reservation of the proposed address
-network ID remain administrative work. The version-0 wire profile,
+network ID remain administrative work. The version-1 wire profile,
 first-admitted conflict rule, and experimental local defaults above are
 the recommended starting point for implementation.
 
@@ -667,6 +720,8 @@ parameters independently.
 
 ## Changelog
 
+- 0.3.0: Replace format 0 with an IP-pair eligibility and priority lottery;
+  retain shared endpoint selection, ECDH-derived times, and local budgets.
 - 0.2.0: Specify epoch-aware origination, experimental assignments and local
   defaults.
 - 0.1.1: Add cryptographic reference code and conformance vectors.
