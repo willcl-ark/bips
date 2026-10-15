@@ -7,7 +7,7 @@
   Type: Specification
   Assigned: ?
   License: BSD-2-Clause
-  Version: 0.1.0
+  Version: 0.1.1
   Requires: 155, 324, 434
 ```
 
@@ -53,9 +53,9 @@ See [RFC 5382](https://www.rfc-editor.org/rfc/rfc5382.html) and
 This is an initial specification for review, not a deployable assignment.
 The address network ID and authors are unassigned. The numerical timing
 profile is provisional and has not been tested on real NATs. Socket
-experiments, realistic gossip measurements, and test vectors remain to be
-completed. The working filename's `v6` means the sixth design, not IPv6 or
-the wire-format version.
+experiments, realistic gossip measurements, and a networking implementation
+remain to be completed. The working filename's `v6` means the sixth design,
+not IPv6 or the wire-format version.
 
 ## Specification
 
@@ -504,20 +504,35 @@ for their own pairs. No anonymity guarantee is made.
 
 ## Reference implementation
 
-No implementation of this protocol is provided yet. The existing
-coordinator-based implementation material is not an implementation of
-this design. Shared-port behavior, simultaneous-open support, clock skew,
-and NAT traversal need experiments on the intended operating systems and
-network devices before the timing profile can be recommended.
+The [Python reference](bip-holepunch-v6/reference.py) implements encoding,
+pair derivation, scheduling, and connection-proof formulas. It reuses the
+BIP 324 reference's secp256k1 arithmetic and is test-only, not constant-time
+or suitable for production secrets. Its IPv4 checks are illustrative;
+implementations must also apply their ordinary destination restrictions.
+
+No networking implementation of this design is provided yet. The existing
+coordinator-based implementation material is not an implementation of it.
+Shared-port behavior, simultaneous-open support, clock skew, and NAT
+traversal need experiments on the intended operating systems and devices
+before public deployment.
 
 ## Test vectors
 
-Test vectors have not yet been provided. They must cover advertisement
-serialization and rejection, secp256k1 key validation, symmetric ECDH and
-KDF derivation, eligibility and offset boundaries, transport roles, and
-session-bound proofs. Lifecycle cases must include epoch transitions,
-conflicting records, opposite clock errors, late gossip, local capacity
-skips, missing proofs, and established connections surviving expiry.
+The [vectors](bip-holepunch-v6/test-vectors.json) contain fixed inputs and
+expected hexadecimal bytes for advertisements, descriptors, ECDH/KDF,
+schedule draws, and both directions of the session-bound proof. They
+include a shared x coordinate with a leading zero, both transport roles,
+invalid compressed keys, and exact eligibility and offset boundaries.
+The sample public endpoints are serialization inputs only; the tests do
+not contact them. The experimental network ID is an explicit input.
+
+Run `python3 bip-holepunch-v6/test_vectors.py` to verify the frozen vectors,
+both sides' derivations, and malformed records and proofs. Regeneration
+requires the explicit `--generate` argument. These tests do not exercise
+sockets or the lifecycle. Networking tests must additionally cover epoch
+transitions, conflicting records, opposite clock errors, late gossip,
+local capacity skips, missing proofs, and established connections
+surviving expiry.
 
 ## Open items
 
@@ -526,8 +541,9 @@ skips, missing proofs, and established connections surviving expiry.
   realistic gossip and socket/NAT experiments, including epoch warm-up.
 - Review the first-admitted conflict rule and its suppression tradeoff.
 - Confirm practical observation, cache, and extra-connection budgets.
-- Produce interoperable implementations and test vectors.
+- Produce interoperable networking implementations.
 
 ## Changelog
 
+- 0.1.1: Add cryptographic reference code and conformance vectors.
 - 0.1.0: Initial coordinatorless IPv4 draft.
